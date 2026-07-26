@@ -16,7 +16,7 @@
 // @connect     translate.google.cn
 // @connect     translate.google.com
 // @connect     translate.googleapis.com
-// @version     2024.05.05.1
+// @version     2026.07.27
 // @name:ja-JP  カタカナターミネーター
 // @name:zh-CN  片假名终结者
 // @description:zh-CN 在网页中的日语外来语上方标注英文原词
@@ -28,6 +28,9 @@ var _ = document;
 var queue = {};  // {"カタカナ": [rtNodeA, rtNodeB]}
 var cachedTranslations = {};  // {"ターミネーター": "Terminator"}
 var newNodes = [_.body];
+var annotationLayer;
+var annotatedNodes = [];
+var annotationUpdatePending = false;
 
 // Recursively traverse the given node and its descendants (Depth-first search)
 function scanTextNodes(node) {
@@ -48,6 +51,8 @@ function scanTextNodes(node) {
     switch (node.nodeType) {
     case Node.ELEMENT_NODE:
         if (node.classList.contains('katakana-terminator-ruby') ||
+            node.classList.contains('katakana-terminator-layer') ||
+            node.classList.contains('katakana-terminator-label') ||
             node.tagName.toLowerCase() in excludeTags || node.isContentEditable) {
             return;
         }
@@ -225,6 +230,101 @@ var apiList = [
     },
 ];
 
+function getAnnotationBackdrop(color) {
+    var match = color && color.match(/rgba?\(\s*(\d+)[, ]+\s*(\d+)[, ]+\s*(\d+)/i);
+    if (!match) {
+        return 'rgba(255, 255, 255, 0.92)';
+    }
+    var luminance = 0.299 * match[1] + 0.587 * match[2] + 0.114 * match[3];
+    return luminance > 170 ? 'rgba(0, 0, 0, 0.82)' : 'rgba(255, 255, 255, 0.92)';
+}
+
+function createAnnotation(node, translation) {
+    if (!annotationLayer) {
+        return;
+    }
+    var label = node.katakanaTerminatorLabel;
+    if (label && !label.isConnected) {
+        label = null;
+    }
+    if (!label) {
+        label = _.createElement('span');
+        label.className = 'katakana-terminator-label';
+        annotationLayer.appendChild(label);
+        node.katakanaTerminatorLabel = label;
+        annotatedNodes.push(node);
+    }
+    label.textContent = translation;
+    scheduleAnnotationUpdate();
+}
+
+function updateAnnotationPositions() {
+    annotationUpdatePending = false;
+    annotatedNodes = annotatedNodes.filter(function(node) {
+        var ruby = node.parentNode;
+        var label = node.katakanaTerminatorLabel;
+        if (!ruby || !ruby.isConnected || !label) {
+            if (label) {
+                label.remove();
+            }
+            node.katakanaTerminatorLabel = null;
+            return false;
+        }
+
+        var viewport = window.visualViewport;
+        var viewportLeft = viewport ? viewport.offsetLeft : 0;
+        var viewportTop = viewport ? viewport.offsetTop : 0;
+        var viewportRight = viewportLeft + (viewport ? viewport.width : window.innerWidth);
+        var viewportBottom = viewportTop + (viewport ? viewport.height : window.innerHeight);
+        var rect = ruby.getBoundingClientRect();
+        if (!rect.width || !rect.height || rect.bottom <= viewportTop || rect.top >= viewportBottom ||
+            rect.right <= viewportLeft || rect.left >= viewportRight) {
+            label.classList.add('katakana-terminator-label-hidden');
+            return true;
+        }
+
+        var color = window.getComputedStyle(ruby).color;
+        label.classList.remove('katakana-terminator-label-hidden');
+        label.style.color = color;
+        label.style.backgroundColor = getAnnotationBackdrop(color);
+        label.style.left = rect.left + rect.width / 2 + 'px';
+        label.style.top = rect.top + 'px';
+        label.style.transform = 'translate(-50%, -100%)';
+
+        // Keep the annotation inside the viewport and place it below the word
+        // when there is not enough room above it.
+        var labelRect = label.getBoundingClientRect();
+        var offset = 0;
+        if (labelRect.left < viewportLeft + 2) {
+            offset = viewportLeft + 2 - labelRect.left;
+        } else if (labelRect.right > viewportRight - 2) {
+            offset = viewportRight - 2 - labelRect.right;
+        }
+        if (offset) {
+            label.style.marginLeft = offset + 'px';
+        } else {
+            label.style.marginLeft = '0';
+        }
+        if (labelRect.top < viewportTop + 2) {
+            label.style.top = rect.bottom + 'px';
+            label.style.transform = 'translate(-50%, 0)';
+            labelRect = label.getBoundingClientRect();
+            if (labelRect.bottom > viewportBottom - 2) {
+                label.style.top = Math.max(viewportTop + 2, viewportBottom - labelRect.height - 2) + 'px';
+            }
+        }
+        return true;
+    });
+}
+
+function scheduleAnnotationUpdate() {
+    if (annotationUpdatePending) {
+        return;
+    }
+    annotationUpdatePending = true;
+    window.requestAnimationFrame(updateAnnotationPositions);
+}
+
 // Clear the pending-translation queue
 function updateRubyByCachedTranslations(phrase) {
     if (!cachedTranslations[phrase]) {
@@ -234,6 +334,7 @@ function updateRubyByCachedTranslations(phrase) {
         node.dataset.rt = cachedTranslations[phrase];
         // Preserve access to long translations that are visually truncated.
         node.parentNode.title = phrase + ' — ' + cachedTranslations[phrase];
+        createAnnotation(node, cachedTranslations[phrase]);
     });
     delete queue[phrase];
 }
@@ -249,48 +350,79 @@ function mutationHandler(mutationList) {
 
 function main() {
     GM_addStyle(`
-        /*
-         * Native ruby annotations participate in inline layout. A long English
-         * translation can therefore widen a short Japanese word, introduce
-         * unexpected line breaks and even stretch flex/grid items. Keep the
-         * annotation out of flow so the original page layout remains stable.
-         */
-        ruby.katakana-terminator-ruby {
-            position: relative !important;
-            ruby-position: over;
-        }
-
+        /* Keep the native ruby node out of layout and draw annotations in a
+         * viewport-level layer instead. This avoids both layout expansion and
+         * clipping by overflow/stacking contexts in the host page. */
         ruby.katakana-terminator-ruby > rt.katakana-terminator-rt {
-            position: absolute !important;
-            z-index: 1;
-            left: 50%;
-            bottom: 100%;
-            display: block !important;
-            box-sizing: border-box;
-            max-width: min(24em, 60vw);
-            overflow: hidden;
-            transform: translateX(-50%);
-            color: currentColor;
-            font-family: sans-serif;
-            font-size: 0.55em;
-            font-style: normal;
-            font-weight: normal;
-            letter-spacing: normal;
-            line-height: 1;
-            text-align: center;
-            text-decoration: none;
-            text-overflow: ellipsis;
-            text-transform: none;
-            white-space: nowrap;
-            word-spacing: normal;
-            pointer-events: none;
-            user-select: none;
+            display: none !important;
         }
 
-        rt.katakana-terminator-rt::before {
-            content: attr(data-rt);
+        .katakana-terminator-layer {
+            position: fixed !important;
+            z-index: 2147483647 !important;
+            inset: 0 !important;
+            width: auto !important;
+            height: auto !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: 0 !important;
+            overflow: visible !important;
+            background: transparent !important;
+            pointer-events: none !important;
+            user-select: none !important;
+        }
+
+        .katakana-terminator-label {
+            position: fixed !important;
+            display: block !important;
+            box-sizing: border-box !important;
+            max-width: min(24em, 60vw) !important;
+            overflow: hidden !important;
+            padding: 1px 2px !important;
+            border-radius: 2px !important;
+            font-family: sans-serif !important;
+            font-size: 10px !important;
+            font-style: normal !important;
+            font-weight: normal !important;
+            letter-spacing: normal !important;
+            line-height: 1 !important;
+            text-align: center !important;
+            text-decoration: none !important;
+            text-overflow: ellipsis !important;
+            text-transform: none !important;
+            white-space: nowrap !important;
+            word-spacing: normal !important;
+            pointer-events: none !important;
+        }
+
+        .katakana-terminator-label-hidden {
+            display: none !important;
         }
     `);
+
+    annotationLayer = _.createElement('div');
+    annotationLayer.className = 'katakana-terminator-layer';
+    annotationLayer.setAttribute('aria-hidden', 'true');
+    // The popover top layer is not clipped by overflow or stacking contexts.
+    // Fall back to an ordinary fixed layer in older browsers.
+    if (typeof annotationLayer.showPopover === 'function') {
+        annotationLayer.setAttribute('popover', 'manual');
+    }
+    _.body.appendChild(annotationLayer);
+    if (typeof annotationLayer.showPopover === 'function') {
+        try {
+            annotationLayer.showPopover();
+        } catch (err) {
+            annotationLayer.removeAttribute('popover');
+        }
+    }
+
+    window.addEventListener('scroll', scheduleAnnotationUpdate, true);
+    window.addEventListener('resize', scheduleAnnotationUpdate);
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('scroll', scheduleAnnotationUpdate);
+        window.visualViewport.addEventListener('resize', scheduleAnnotationUpdate);
+    }
 
     var observer = new MutationObserver(mutationHandler);
     observer.observe(_.body, {childList: true, subtree: true});
