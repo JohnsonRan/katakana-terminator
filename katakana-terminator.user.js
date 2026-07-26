@@ -16,7 +16,7 @@
 // @connect     translate.google.cn
 // @connect     translate.google.com
 // @connect     translate.googleapis.com
-// @version     2024.05.05
+// @version     2024.05.05.1
 // @name:ja-JP  カタカナターミネーター
 // @name:zh-CN  片假名终结者
 // @description:zh-CN 在网页中的日语外来语上方标注英文原词
@@ -36,12 +36,19 @@ function scanTextNodes(node) {
         return;
     }
 
-    // Ignore text boxes and echoes
-    var excludeTags = {ruby: true, script: true, select: true, textarea: true};
+    // Ignore editable, preformatted, executable and non-HTML content. Apart from
+    // producing unwanted annotations, wrapping text in these elements can change
+    // their semantics or break layout-sensitive widgets.
+    var excludeTags = {
+        code: true, kbd: true, math: true, noscript: true, option: true,
+        pre: true, ruby: true, samp: true, script: true, select: true,
+        style: true, svg: true, template: true, textarea: true,
+    };
 
     switch (node.nodeType) {
     case Node.ELEMENT_NODE:
-        if (node.tagName.toLowerCase() in excludeTags || node.isContentEditable) {
+        if (node.classList.contains('katakana-terminator-ruby') ||
+            node.tagName.toLowerCase() in excludeTags || node.isContentEditable) {
             return;
         }
         return Array.from(node.childNodes).forEach(scanTextNodes);
@@ -59,6 +66,7 @@ function addRuby(node) {
         return false;
     }
     var ruby = _.createElement('ruby');
+    ruby.classList.add('katakana-terminator-ruby');
     ruby.appendChild(_.createTextNode(match[0]));
     var rt = _.createElement('rt');
     rt.classList.add('katakana-terminator-rt');
@@ -224,6 +232,8 @@ function updateRubyByCachedTranslations(phrase) {
     }
     (queue[phrase] || []).forEach(function(node) {
         node.dataset.rt = cachedTranslations[phrase];
+        // Preserve access to long translations that are visually truncated.
+        node.parentNode.title = phrase + ' — ' + cachedTranslations[phrase];
     });
     delete queue[phrase];
 }
@@ -238,7 +248,49 @@ function mutationHandler(mutationList) {
 }
 
 function main() {
-    GM_addStyle("rt.katakana-terminator-rt::before { content: attr(data-rt); }");
+    GM_addStyle(`
+        /*
+         * Native ruby annotations participate in inline layout. A long English
+         * translation can therefore widen a short Japanese word, introduce
+         * unexpected line breaks and even stretch flex/grid items. Keep the
+         * annotation out of flow so the original page layout remains stable.
+         */
+        ruby.katakana-terminator-ruby {
+            position: relative !important;
+            ruby-position: over;
+        }
+
+        ruby.katakana-terminator-ruby > rt.katakana-terminator-rt {
+            position: absolute !important;
+            z-index: 1;
+            left: 50%;
+            bottom: 100%;
+            display: block !important;
+            box-sizing: border-box;
+            max-width: min(24em, 60vw);
+            overflow: hidden;
+            transform: translateX(-50%);
+            color: currentColor;
+            font-family: sans-serif;
+            font-size: 0.55em;
+            font-style: normal;
+            font-weight: normal;
+            letter-spacing: normal;
+            line-height: 1;
+            text-align: center;
+            text-decoration: none;
+            text-overflow: ellipsis;
+            text-transform: none;
+            white-space: nowrap;
+            word-spacing: normal;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        rt.katakana-terminator-rt::before {
+            content: attr(data-rt);
+        }
+    `);
 
     var observer = new MutationObserver(mutationHandler);
     observer.observe(_.body, {childList: true, subtree: true});
