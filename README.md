@@ -7,9 +7,9 @@ A browser extension to convert *gairaigo* (Japanese loan words) back to English.
 
 #### Installation 安装
 Please follow the [installation instructions](https://greasyfork.org/en) to configure your browser,
-then [click here to get the user script](https://github.com/Arnie97/katakana-terminator/raw/master/katakana-terminator.user.js).
+then [click here to get the user script](https://github.com/JohnsonRan/katakana-terminator/raw/master/katakana-terminator.user.js).
 
-请先[阅读教程](https://greasyfork.org/zh-CN)，在浏览器中安装一个用户脚本管理器。之后[戳这里下载并安装本程序](https://github.com/Arnie97/katakana-terminator/raw/master/katakana-terminator.user.js)。
+请先[阅读教程](https://greasyfork.org/zh-CN)，在浏览器中安装一个用户脚本管理器。之后[戳这里下载并安装本程序](https://github.com/JohnsonRan/katakana-terminator/raw/master/katakana-terminator.user.js)。
 
 #### Limits 已知缺陷
 *Gairaigo* from other source languages is also converted to English.
