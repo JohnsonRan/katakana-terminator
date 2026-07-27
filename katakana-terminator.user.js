@@ -16,7 +16,7 @@
 // @connect     translate.google.cn
 // @connect     translate.google.com
 // @connect     translate.googleapis.com
-// @version     2026.07.27
+// @version     2026.07.27.1
 // @name:ja-JP  カタカナターミネーター
 // @name:zh-CN  片假名终结者
 // @description:zh-CN 在网页中的日语外来语上方标注英文原词
@@ -287,8 +287,12 @@ function updateAnnotationPositions() {
         label.classList.remove('katakana-terminator-label-hidden');
         label.style.color = color;
         label.style.backgroundColor = getAnnotationBackdrop(color);
-        label.style.left = rect.left + rect.width / 2 + 'px';
-        label.style.top = rect.top + 'px';
+        // Store positions in document coordinates. Unlike fixed labels that
+        // have to chase every scroll frame from JavaScript, absolute labels
+        // then move with the page in the browser's compositor. This prevents
+        // visible lag and flicker during mobile scrolling.
+        label.style.left = window.scrollX + rect.left + rect.width / 2 + 'px';
+        label.style.top = window.scrollY + rect.top + 'px';
         label.style.transform = 'translate(-50%, -100%)';
 
         // Keep the annotation inside the viewport and place it below the word
@@ -306,11 +310,13 @@ function updateAnnotationPositions() {
             label.style.marginLeft = '0';
         }
         if (labelRect.top < viewportTop + 2) {
-            label.style.top = rect.bottom + 'px';
+            label.style.top = window.scrollY + rect.bottom + 'px';
             label.style.transform = 'translate(-50%, 0)';
             labelRect = label.getBoundingClientRect();
             if (labelRect.bottom > viewportBottom - 2) {
-                label.style.top = Math.max(viewportTop + 2, viewportBottom - labelRect.height - 2) + 'px';
+                label.style.top = window.scrollY + Math.max(
+                    viewportTop + 2, viewportBottom - labelRect.height - 2
+                ) + 'px';
             }
         }
         return true;
@@ -351,18 +357,21 @@ function mutationHandler(mutationList) {
 function main() {
     GM_addStyle(`
         /* Keep the native ruby node out of layout and draw annotations in a
-         * viewport-level layer instead. This avoids both layout expansion and
-         * clipping by overflow/stacking contexts in the host page. */
+         * document-level layer instead. This avoids layout expansion and lets
+         * mobile browsers scroll the labels in the compositor without waiting
+         * for JavaScript to update fixed coordinates on every frame. */
         ruby.katakana-terminator-ruby > rt.katakana-terminator-rt {
             display: none !important;
         }
 
         .katakana-terminator-layer {
-            position: fixed !important;
+            position: absolute !important;
             z-index: 2147483647 !important;
-            inset: 0 !important;
-            width: auto !important;
-            height: auto !important;
+            inset: auto !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 0 !important;
+            height: 0 !important;
             margin: 0 !important;
             padding: 0 !important;
             border: 0 !important;
@@ -373,7 +382,7 @@ function main() {
         }
 
         .katakana-terminator-label {
-            position: fixed !important;
+            position: absolute !important;
             display: block !important;
             box-sizing: border-box !important;
             max-width: min(24em, 60vw) !important;
@@ -404,7 +413,7 @@ function main() {
     annotationLayer.className = 'katakana-terminator-layer';
     annotationLayer.setAttribute('aria-hidden', 'true');
     // The popover top layer is not clipped by overflow or stacking contexts.
-    // Fall back to an ordinary fixed layer in older browsers.
+    // Fall back to an ordinary document-level layer in older browsers.
     if (typeof annotationLayer.showPopover === 'function') {
         annotationLayer.setAttribute('popover', 'manual');
     }
@@ -417,10 +426,19 @@ function main() {
         }
     }
 
-    window.addEventListener('scroll', scheduleAnnotationUpdate, true);
+    // Document scrolling already moves absolute labels together with their
+    // words, so rewriting every label during a root/visual-viewport scroll is
+    // unnecessary and can force repaints that flicker on mobile. Nested scroll
+    // containers still need a position update because the layer is outside of
+    // those containers.
+    window.addEventListener('scroll', function(event) {
+        if (event.target !== _ && event.target !== _.documentElement &&
+            event.target !== _.body) {
+            scheduleAnnotationUpdate();
+        }
+    }, true);
     window.addEventListener('resize', scheduleAnnotationUpdate);
     if (window.visualViewport) {
-        window.visualViewport.addEventListener('scroll', scheduleAnnotationUpdate);
         window.visualViewport.addEventListener('resize', scheduleAnnotationUpdate);
     }
 
