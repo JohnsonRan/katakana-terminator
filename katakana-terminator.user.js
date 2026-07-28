@@ -16,7 +16,7 @@
 // @connect     translate.google.cn
 // @connect     translate.google.com
 // @connect     translate.googleapis.com
-// @version     2026.07.27.1
+// @version     2026.07.28.1
 // @name:ja-JP  カタカナターミネーター
 // @name:zh-CN  片假名终结者
 // @description:zh-CN 在网页中的日语外来语上方标注英文原词
@@ -31,6 +31,40 @@ var newNodes = [_.body];
 var annotationLayer;
 var annotatedNodes = [];
 var annotationUpdatePending = false;
+
+// Return whether an element is currently rendered. Hidden subtrees are skipped
+// before ruby nodes are created, so their text is not sent for translation.
+// Do not test viewport intersection here: off-screen page content is still part
+// of the visible document and should be ready when the user scrolls to it.
+function isRenderedElement(element) {
+    // display:contents has no box of its own, but its descendants can still be
+    // visible. Let the ancestor fallback handle that case.
+    var ownStyle = window.getComputedStyle(element);
+    if (ownStyle.display !== 'contents' &&
+        typeof element.checkVisibility === 'function') {
+        return element.checkVisibility({
+            checkOpacity: true,
+            checkVisibilityCSS: true,
+        });
+    }
+
+    // Fallback for browsers without Element.checkVisibility(). Walk ancestors
+    // because getComputedStyle(element) alone does not expose display:none on a
+    // parent. "hidden" is checked explicitly for older browser engines.
+    while (element && element.nodeType === Node.ELEMENT_NODE) {
+        if (element.hidden) {
+            return false;
+        }
+        var style = window.getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden' ||
+            style.visibility === 'collapse' || parseFloat(style.opacity) === 0 ||
+            style.contentVisibility === 'hidden') {
+            return false;
+        }
+        element = element.parentElement;
+    }
+    return true;
+}
 
 // Recursively traverse the given node and its descendants (Depth-first search)
 function scanTextNodes(node) {
@@ -53,12 +87,16 @@ function scanTextNodes(node) {
         if (node.classList.contains('katakana-terminator-ruby') ||
             node.classList.contains('katakana-terminator-layer') ||
             node.classList.contains('katakana-terminator-label') ||
-            node.tagName.toLowerCase() in excludeTags || node.isContentEditable) {
+            node.tagName.toLowerCase() in excludeTags || node.isContentEditable ||
+            !isRenderedElement(node)) {
             return;
         }
         return Array.from(node.childNodes).forEach(scanTextNodes);
 
     case Node.TEXT_NODE:
+        if (!node.parentElement || !isRenderedElement(node.parentElement)) {
+            return;
+        }
         while ((node = addRuby(node)));
     }
 }
@@ -351,6 +389,15 @@ function mutationHandler(mutationList) {
         mutationRecord.addedNodes.forEach(function(node) {
             newNodes.push(node);
         });
+        // A hidden panel can become visible through a class/style/hidden change.
+        // Rescan that subtree then; already annotated ruby nodes are ignored.
+        if (mutationRecord.type === 'attributes') {
+            var target = mutationRecord.target;
+            if (!target.closest('.katakana-terminator-ruby, ' +
+                    '.katakana-terminator-layer, .katakana-terminator-label')) {
+                newNodes.push(target);
+            }
+        }
     });
 }
 
@@ -443,7 +490,12 @@ function main() {
     }
 
     var observer = new MutationObserver(mutationHandler);
-    observer.observe(_.body, {childList: true, subtree: true});
+    observer.observe(_.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class', 'style', 'hidden'],
+    });
 
     function rescanTextNodes() {
         // Deplete buffered mutations
