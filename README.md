@@ -1,15 +1,30 @@
 ### Katakana Terminator 片假名终结者 カタカナ‌ターミネーター
 
 #### In a nutshell 简介
-A browser extension to convert *gairaigo* (Japanese loan words) back to English.
+A userscript that converts *gairaigo* (Japanese loan words) back to English by annotating katakana on web pages.
 
-这是一个浏览器扩展插件，在网页中的日语外来语上方标注英文原词。
+这是一个用户脚本：在网页中的日语外来语（片假名）上方标注英文原词。
 
 #### Installation 安装
-Please follow the [installation instructions](https://greasyfork.org/en) to configure your browser,
-then [click here to get the user script](https://github.com/JohnsonRan/katakana-terminator/raw/master/katakana-terminator.user.js).
+Please follow the [installation instructions](https://greasyfork.org/en) to configure a userscript manager (Tampermonkey / Violentmonkey / Greasemonkey),
+then [click here to install the user script](https://github.com/JohnsonRan/katakana-terminator/raw/master/katakana-terminator.user.js).
 
 请先[阅读教程](https://greasyfork.org/zh-CN)，在浏览器中安装一个用户脚本管理器。之后[戳这里下载并安装本程序](https://github.com/JohnsonRan/katakana-terminator/raw/master/katakana-terminator.user.js)。
+
+#### Features 功能要点
+- Floating annotation layer (avoids breaking page layout with native ruby rendering)
+- Mutation-driven rescans with debouncing (low overhead on dynamic pages)
+- Persistent translation cache across pages
+- API fallback between Google Translate endpoints
+- Menu commands: global toggle, per-site blacklist, clear cache
+- Sparse mode on non-Japanese pages until katakana is detected
+
+- 浮动标注层，减少对页面排版的影响
+- 基于 DOM 变动的防抖扫描，降低动态页面开销
+- 跨页面持久化翻译缓存
+- Google 翻译接口自动回退
+- 菜单：总开关、当前网站黑名单、清空缓存
+- 非日语页面默认稀疏扫描，发现片假名后再全力工作
 
 #### Limits 已知缺陷
 *Gairaigo* from other source languages is also converted to English.
@@ -19,7 +34,9 @@ then [click here to get the user script](https://github.com/JohnsonRan/katakana-
 #### Thanks 致谢
 Based on the Google Translate API, which was described in [this post](https://github.com/ssut/py-googletrans/issues/268).
 
-基于谷歌翻译开发，[API 参考此处](https://github.com/ssut/py-googletrans/issues/268)。
+Original project by [Arnie97](https://github.com/Arnie97/katakana-terminator).
+
+基于谷歌翻译开发，[API 参考此处](https://github.com/ssut/py-googletrans/issues/268)。原作：[Arnie97](https://github.com/Arnie97/katakana-terminator)。
 
 #### Feedback 反馈
 The GitHub issue tracker has been disabled to prevent duplicate comments.
