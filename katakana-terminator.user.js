@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Katakana Terminator
-// @description Convert gairaigo (Japanese loan words) back to English
+// @description Convert gairaigo (Japanese loan words) back to English with parenthetical glosses
 // @author      Arnie97
 // @license     MIT
 // @copyright   2017-2026, Katakana Terminator Contributors (https://github.com/Arnie97/katakana-terminator/graphs/contributors)
@@ -25,10 +25,10 @@
 // @connect     translate.google.cn
 // @connect     translate.google.com
 // @connect     translate.googleapis.com
-// @version     2026.07.30.1
+// @version     2026.07.30.5
 // @name:ja-JP  カタカナターミネーター
 // @name:zh-CN  片假名终结者
-// @description:zh-CN 在网页中的日语外来语上方标注英文原词
+// @description:zh-CN 在网页中的日语外来语后用括号标注英文原词
 // ==/UserScript==
 
 (function () {
@@ -103,6 +103,9 @@
     var FAIL_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
     var RESCAN_DEBOUNCE_MS = 200;
     var RESCAN_FALLBACK_MS = 4000;
+    var VIEWPORT_RESCAN_MS = 250;
+    // Slightly expand the viewport so words near the edge are ready while scrolling.
+    var VIEWPORT_MARGIN_PX = 80;
     var MAX_URL_QUERY_BYTES = 1600;
     var MAX_INFLIGHT_REQUESTS = 2;
     var MIN_JP_CHARS_FOR_EAGER = 15;
@@ -113,12 +116,11 @@
     var cacheMeta = {}; // {phrase: lastUsedMs}
     var failedTranslations = {}; // {phrase: failedAtMs}
     var newNodes = new Set();
-    var annotationLayer = null;
-    var annotatedNodes = [];
-    var labelMap = new WeakMap();
-    var annotationUpdatePending = false;
-    var visibilityCache = new WeakMap();
+    var visibilityCache = new WeakMap(); // element -> rendered?
+    var userVisibleCache = new WeakMap(); // element -> currently on-screen?
+    var clipStyleCache = new WeakMap(); // element -> clips descendants?
     var rescanTimer = null;
+    var viewportRescanTimer = null;
     var persistTimer = null;
     var observer = null;
     var started = false;
@@ -278,10 +280,251 @@
     }
 
     // ---- Visibility ----
-    // Return whether an element is currently rendered. Hidden subtrees are skipped
-    // before ruby nodes are created, so their text is not sent for translation.
-    // Do not test viewport intersection here: off-screen page content is still part
-    // of the visible document and should be ready when the user scrolls to it.
+    // Two layers:
+    // 1) isRenderedElement — CSS says the node participates in rendering
+    // 2) isUserVisible — the node currently paints inside the viewport and is
+    //    not clipped away by overflow/aria-hidden ancestors (what the user sees).
+    function isAriaOrInertHidden(element) {
+        // Hidden menus/panels often stay in the layout tree with aria-hidden/inert
+        // even when checkVisibility() still reports them as visible.
+        var current = element;
+        while (current && current.nodeType === Node.ELEMENT_NODE) {
+            if (current.inert) {
+                return true;
+            }
+            if (current.getAttribute && current.getAttribute('aria-hidden') === 'true') {
+                return true;
+            }
+            current = current.parentElement;
+        }
+        return false;
+    }
+
+    function getViewportRect(margin) {
+        margin = margin || 0;
+        var viewport = window.visualViewport;
+        var left = (viewport ? viewport.offsetLeft : 0) - margin;
+        var top = (viewport ? viewport.offsetTop : 0) - margin;
+        var width = (viewport ? viewport.width : window.innerWidth) + margin * 2;
+        var height = (viewport ? viewport.height : window.innerHeight) + margin * 2;
+        return {
+            left: left,
+            top: top,
+            right: left + width,
+            bottom: top + height,
+            width: width,
+            height: height,
+        };
+    }
+
+    function rectsIntersect(a, b) {
+        return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+    }
+
+    function intersectRects(a, b) {
+        var left = Math.max(a.left, b.left);
+        var top = Math.max(a.top, b.top);
+        var right = Math.min(a.right, b.right);
+        var bottom = Math.min(a.bottom, b.bottom);
+        if (right <= left || bottom <= top) {
+            return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+        }
+        return {
+            left: left,
+            top: top,
+            right: right,
+            bottom: bottom,
+            width: right - left,
+            height: bottom - top,
+        };
+    }
+
+    function elementClipsDescendants(element) {
+        if (clipStyleCache.has(element)) {
+            return clipStyleCache.get(element);
+        }
+        var style = window.getComputedStyle(element);
+        var overflowX = style.overflowX;
+        var overflowY = style.overflowY;
+        var clips = overflowX === 'hidden' || overflowX === 'clip' || overflowX === 'auto' ||
+            overflowX === 'scroll' || overflowY === 'hidden' || overflowY === 'clip' ||
+            overflowY === 'auto' || overflowY === 'scroll' || style.contain === 'paint' ||
+            style.contain === 'strict' || style.contain === 'content' ||
+            style.contentVisibility === 'auto' || style.contentVisibility === 'hidden' ||
+            (style.clipPath && style.clipPath !== 'none');
+        clipStyleCache.set(element, clips);
+        return clips;
+    }
+
+    // True when the element's box currently intersects the (margined) viewport
+    // after clipping by overflow ancestors. This is the "is it on screen now?" test.
+    function isUserVisible(element, margin) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE) {
+            return false;
+        }
+        if (userVisibleCache.has(element)) {
+            return userVisibleCache.get(element);
+        }
+        if (!isRenderedElement(element) || isAriaOrInertHidden(element)) {
+            userVisibleCache.set(element, false);
+            return false;
+        }
+
+        var rect = element.getBoundingClientRect();
+        if (!rect.width || !rect.height) {
+            userVisibleCache.set(element, false);
+            return false;
+        }
+
+        var viewportRect = getViewportRect(margin == null ? VIEWPORT_MARGIN_PX : margin);
+        var visibleRect = {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+            width: rect.width,
+            height: rect.height,
+        };
+
+        if (!rectsIntersect(visibleRect, viewportRect)) {
+            userVisibleCache.set(element, false);
+            return false;
+        }
+
+        var parent = element.parentElement;
+        while (parent && parent.nodeType === Node.ELEMENT_NODE &&
+            parent !== document.documentElement) {
+            if (elementClipsDescendants(parent)) {
+                var parentRect = parent.getBoundingClientRect();
+                visibleRect = intersectRects(visibleRect, parentRect);
+                if (!visibleRect.width || !visibleRect.height) {
+                    userVisibleCache.set(element, false);
+                    return false;
+                }
+            }
+            parent = parent.parentElement;
+        }
+
+        var visible = rectsIntersect(visibleRect, viewportRect);
+        userVisibleCache.set(element, visible);
+        return visible;
+    }
+
+    // Whether a DOM Range currently paints inside the viewport after overflow clip.
+    function isRangeUserVisible(range, clipRoot, margin) {
+        if (!range) {
+            return false;
+        }
+        var rects;
+        try {
+            rects = range.getClientRects();
+        } catch (err) {
+            return false;
+        }
+        if (!rects || !rects.length) {
+            return false;
+        }
+
+        var viewportRect = getViewportRect(margin == null ? VIEWPORT_MARGIN_PX : margin);
+        var parent = clipRoot;
+        for (var i = 0; i < rects.length; i++) {
+            var rect = rects[i];
+            if (!rect.width && !rect.height) {
+                continue;
+            }
+            var visibleRect = {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+                width: rect.width,
+                height: rect.height,
+            };
+            if (!rectsIntersect(visibleRect, viewportRect)) {
+                continue;
+            }
+
+            var ancestor = parent;
+            var clippedOut = false;
+            while (ancestor && ancestor.nodeType === Node.ELEMENT_NODE &&
+                ancestor !== document.documentElement) {
+                if (elementClipsDescendants(ancestor)) {
+                    visibleRect = intersectRects(visibleRect, ancestor.getBoundingClientRect());
+                    if (!visibleRect.width || !visibleRect.height) {
+                        clippedOut = true;
+                        break;
+                    }
+                }
+                ancestor = ancestor.parentElement;
+            }
+            if (clippedOut) {
+                continue;
+            }
+            if (rectsIntersect(visibleRect, viewportRect)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Text-node geometry matters: a tall parent can intersect the viewport while
+    // the katakana itself is still below the fold.
+    function isTextNodeUserVisible(textNode, margin) {
+        var parent = textNode && textNode.parentElement;
+        if (!parent || !textNode.nodeValue || !isRenderedElement(parent) ||
+            isAriaOrInertHidden(parent)) {
+            return false;
+        }
+
+        try {
+            var range = document.createRange();
+            range.selectNodeContents(textNode);
+            return isRangeUserVisible(range, parent, margin);
+        } catch (err) {
+            return isUserVisible(parent, margin);
+        }
+    }
+
+    function isMatchUserVisible(textNode, start, end, margin) {
+        var parent = textNode && textNode.parentElement;
+        if (!parent || !isRenderedElement(parent) || isAriaOrInertHidden(parent)) {
+            return false;
+        }
+        try {
+            var range = document.createRange();
+            range.setStart(textNode, start);
+            range.setEnd(textNode, end);
+            return isRangeUserVisible(range, parent, margin);
+        } catch (err) {
+            return isUserVisible(parent, margin);
+        }
+    }
+
+    // Can this element's descendants possibly paint on screen? Used to prune DFS.
+    // Overflow:visible parents may paint children outside their own box, so only
+    // prune when the element itself clips (or has no box while rendered as a box).
+    function canSubtreeBeUserVisible(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE) {
+            return false;
+        }
+        if (!isRenderedElement(element) || isAriaOrInertHidden(element)) {
+            return false;
+        }
+        var style = window.getComputedStyle(element);
+        if (style.display === 'contents') {
+            return true;
+        }
+        var rect = element.getBoundingClientRect();
+        if (!rect.width && !rect.height) {
+            // Zero-box elements can still host overflowing visible children.
+            return !elementClipsDescendants(element);
+        }
+        if (!elementClipsDescendants(element)) {
+            return true;
+        }
+        return rectsIntersect(rect, getViewportRect(VIEWPORT_MARGIN_PX));
+    }
+
     function isRenderedElement(element) {
         if (!element || element.nodeType !== Node.ELEMENT_NODE) {
             return false;
@@ -291,6 +534,11 @@
         }
 
         var visible;
+        if (isAriaOrInertHidden(element)) {
+            visibilityCache.set(element, false);
+            return false;
+        }
+
         var ownStyle = window.getComputedStyle(element);
         // display:contents has no box of its own, but its descendants can still be
         // visible. Let the ancestor fallback handle that case.
@@ -335,15 +583,16 @@
 
     function resetVisibilityCache() {
         visibilityCache = new WeakMap();
+        userVisibleCache = new WeakMap();
+        clipStyleCache = new WeakMap();
     }
 
     function shouldSkipElement(node) {
         if (!node || node.nodeType !== Node.ELEMENT_NODE) {
             return true;
         }
-        if (node.classList.contains('katakana-terminator-ruby') ||
-            node.classList.contains('katakana-terminator-layer') ||
-            node.classList.contains('katakana-terminator-label')) {
+        if (node.classList.contains('katakana-terminator-word') ||
+            node.classList.contains('katakana-terminator-gloss')) {
             return true;
         }
         var tag = node.tagName && node.tagName.toLowerCase();
@@ -372,6 +621,8 @@
     }
 
     // Iterative DFS — avoids deep recursion and intermediate child arrays.
+    // Only wraps katakana that is currently user-visible; off-screen / clipped /
+    // aria-hidden text is left alone until a later viewport rescan.
     function scanTextNodes(root) {
         if (!root || !document.body || !document.body.contains(root)) {
             return;
@@ -390,7 +641,7 @@
             }
 
             if (node.nodeType === Node.ELEMENT_NODE) {
-                if (shouldSkipElement(node) || !isRenderedElement(node)) {
+                if (shouldSkipElement(node) || !canSubtreeBeUserVisible(node)) {
                     continue;
                 }
                 var children = node.childNodes;
@@ -401,7 +652,7 @@
             }
 
             if (node.nodeType === Node.TEXT_NODE) {
-                if (!node.parentElement || !isRenderedElement(node.parentElement)) {
+                if (!isTextNodeUserVisible(node)) {
                     continue;
                 }
                 while ((node = addRuby(node)));
@@ -409,27 +660,40 @@
         }
     }
 
-    // Recursively add ruby tags to text nodes
+    // Wrap visible katakana matches and append an empty gloss slot for the English.
     // Inspired by http://www.the-art-of-web.com/javascript/search-highlight/
+    // Result: カタカナ（Katakana）
     function addRuby(node) {
         var match;
         if (!node.nodeValue || !(match = KATAKANA_RE.exec(node.nodeValue))) {
             return false;
         }
-        var ruby = document.createElement('ruby');
-        ruby.classList.add('katakana-terminator-ruby');
-        ruby.appendChild(document.createTextNode(match[0]));
-        var rt = document.createElement('rt');
-        rt.classList.add('katakana-terminator-rt');
-        ruby.appendChild(rt);
+
+        var start = match.index;
+        var end = start + match[0].length;
+        // Only wrap the specific match when that glyph box is on-screen. Off-screen
+        // matches are left as plain text and picked up by a later viewport rescan.
+        if (!isMatchUserVisible(node, start, end)) {
+            if (end >= node.nodeValue.length) {
+                return false;
+            }
+            return node.splitText(end);
+        }
+
+        var word = document.createElement('span');
+        word.classList.add('katakana-terminator-word');
+        word.appendChild(document.createTextNode(match[0]));
+        var gloss = document.createElement('span');
+        gloss.classList.add('katakana-terminator-gloss');
+        word.appendChild(gloss);
 
         queue[match[0]] = queue[match[0]] || [];
-        queue[match[0]].push(rt);
+        queue[match[0]].push(gloss);
 
         // <span>[startカナmiddleテストend]</span> =>
-        // <span>start<ruby>カナ<rt data-rt="Kana"></rt></ruby>[middleテストend]</span>
-        var after = node.splitText(match.index);
-        node.parentNode.insertBefore(ruby, after);
+        // <span>start<span class="word">カナ<span class="gloss"></span></span>[middleテストend]</span>
+        var after = node.splitText(start);
+        node.parentNode.insertBefore(word, after);
         after.nodeValue = after.nodeValue.substring(match[0].length);
         return after;
     }
@@ -655,117 +919,22 @@
     ];
 
     // ---- Annotations ----
-    function getAnnotationBackdrop(color) {
-        var match = color && color.match(/rgba?\(\s*(\d+)[, ]+\s*(\d+)[, ]+\s*(\d+)/i);
-        if (!match) {
-            return 'rgba(255, 255, 255, 0.92)';
-        }
-        var luminance = 0.299 * match[1] + 0.587 * match[2] + 0.114 * match[3];
-        return luminance > 170 ? 'rgba(0, 0, 0, 0.82)' : 'rgba(255, 255, 255, 0.92)';
-    }
-
-    function createAnnotation(node, translation) {
-        if (!annotationLayer) {
-            return;
-        }
-        var label = labelMap.get(node);
-        if (label && !label.isConnected) {
-            label = null;
-            labelMap.delete(node);
-        }
-        if (!label) {
-            label = document.createElement('span');
-            label.className = 'katakana-terminator-label';
-            annotationLayer.appendChild(label);
-            labelMap.set(node, label);
-            annotatedNodes.push(node);
-        }
-        label.textContent = translation;
-        scheduleAnnotationUpdate();
-    }
-
-    function updateAnnotationPositions() {
-        annotationUpdatePending = false;
-        annotatedNodes = annotatedNodes.filter(function (node) {
-            var ruby = node.parentNode;
-            var label = labelMap.get(node);
-            if (!ruby || !ruby.isConnected || !label) {
-                if (label) {
-                    label.remove();
-                }
-                labelMap.delete(node);
-                return false;
-            }
-
-            var viewport = window.visualViewport;
-            var viewportLeft = viewport ? viewport.offsetLeft : 0;
-            var viewportTop = viewport ? viewport.offsetTop : 0;
-            var viewportRight = viewportLeft + (viewport ? viewport.width : window.innerWidth);
-            var viewportBottom = viewportTop + (viewport ? viewport.height : window.innerHeight);
-            var rect = ruby.getBoundingClientRect();
-            if (!rect.width || !rect.height || rect.bottom <= viewportTop || rect.top >= viewportBottom ||
-                rect.right <= viewportLeft || rect.left >= viewportRight) {
-                label.classList.add('katakana-terminator-label-hidden');
-                return true;
-            }
-
-            var color = window.getComputedStyle(ruby).color;
-            label.classList.remove('katakana-terminator-label-hidden');
-            label.style.color = color;
-            label.style.backgroundColor = getAnnotationBackdrop(color);
-            // Store positions in document coordinates. Unlike fixed labels that
-            // have to chase every scroll frame from JavaScript, absolute labels
-            // then move with the page in the browser's compositor. This prevents
-            // visible lag and flicker during mobile scrolling.
-            label.style.left = window.scrollX + rect.left + rect.width / 2 + 'px';
-            label.style.top = window.scrollY + rect.top + 'px';
-            label.style.transform = 'translate(-50%, -100%)';
-
-            // Keep the annotation inside the viewport and place it below the word
-            // when there is not enough room above it.
-            var labelRect = label.getBoundingClientRect();
-            var offset = 0;
-            if (labelRect.left < viewportLeft + 2) {
-                offset = viewportLeft + 2 - labelRect.left;
-            } else if (labelRect.right > viewportRight - 2) {
-                offset = viewportRight - 2 - labelRect.right;
-            }
-            if (offset) {
-                label.style.marginLeft = offset + 'px';
-            } else {
-                label.style.marginLeft = '0';
-            }
-            if (labelRect.top < viewportTop + 2) {
-                label.style.top = window.scrollY + rect.bottom + 'px';
-                label.style.transform = 'translate(-50%, 0)';
-                labelRect = label.getBoundingClientRect();
-                if (labelRect.bottom > viewportBottom - 2) {
-                    label.style.top = window.scrollY + Math.max(
-                        viewportTop + 2, viewportBottom - labelRect.height - 2
-                    ) + 'px';
-                }
-            }
-            return true;
-        });
-    }
-
-    function scheduleAnnotationUpdate() {
-        if (annotationUpdatePending) {
-            return;
-        }
-        annotationUpdatePending = true;
-        window.requestAnimationFrame(updateAnnotationPositions);
-    }
-
+    // Append the English gloss in parentheses after the original katakana:
+    // カタカナ（Terminator）. Stays in normal text flow — no overlay, no extra line box.
     function updateRubyByCachedTranslations(phrase) {
         if (!cachedTranslations[phrase]) {
             return;
         }
         (queue[phrase] || []).forEach(function (node) {
-            node.dataset.rt = cachedTranslations[phrase];
-            // Preserve access to long translations that are visually truncated.
-            node.parentNode.title = phrase + ' — ' + cachedTranslations[phrase];
-            createAnnotation(node, cachedTranslations[phrase]);
+            if (!node || !node.isConnected) {
+                return;
+            }
+            var translation = cachedTranslations[phrase];
+            node.dataset.rt = translation;
+            node.textContent = '（' + translation + '）';
+            if (node.parentNode) {
+                node.parentNode.title = phrase + ' — ' + translation;
+            }
         });
         delete queue[phrase];
     }
@@ -783,7 +952,7 @@
             if (mutationRecord.type === 'attributes') {
                 var target = mutationRecord.target;
                 if (target.nodeType === Node.ELEMENT_NODE &&
-                    !target.closest('.katakana-terminator-ruby, .katakana-terminator-layer, .katakana-terminator-label')) {
+                    !target.closest('.katakana-terminator-word, .katakana-terminator-gloss')) {
                     newNodes.add(target);
                 }
             }
@@ -801,6 +970,22 @@
             rescanTimer = null;
             rescanTextNodes();
         }, RESCAN_DEBOUNCE_MS);
+    }
+
+    // Off-screen text is intentionally skipped during the first pass. When the
+    // user scrolls/resizes, re-walk the document for newly visible katakana.
+    function scheduleViewportRescan() {
+        if (viewportRescanTimer) {
+            return;
+        }
+        viewportRescanTimer = setTimeout(function () {
+            viewportRescanTimer = null;
+            if (!isScriptActive() || !started || !document.body) {
+                return;
+            }
+            newNodes.add(document.body);
+            scheduleRescan();
+        }, VIEWPORT_RESCAN_MS);
     }
 
     function detectEagerMode() {
@@ -906,84 +1091,52 @@
             return;
         }
 
+        // Parenthetical gloss after the word: カタカナ（Katakana）
         gmAddStyle(
-            'ruby.katakana-terminator-ruby > rt.katakana-terminator-rt {' +
-            '  display: none !important;' +
-            '}' +
-            '.katakana-terminator-layer {' +
-            '  position: absolute !important;' +
-            '  z-index: 2147483647 !important;' +
-            '  inset: auto !important;' +
-            '  top: 0 !important;' +
-            '  left: 0 !important;' +
-            '  width: 0 !important;' +
-            '  height: 0 !important;' +
+            '.katakana-terminator-word {' +
+            '  display: inline !important;' +
             '  margin: 0 !important;' +
             '  padding: 0 !important;' +
             '  border: 0 !important;' +
-            '  overflow: visible !important;' +
             '  background: transparent !important;' +
-            '  pointer-events: none !important;' +
-            '  user-select: none !important;' +
+            '  color: inherit !important;' +
+            '  font: inherit !important;' +
+            '  letter-spacing: inherit !important;' +
+            '  line-height: inherit !important;' +
+            '  text-indent: 0 !important;' +
+            '  white-space: inherit !important;' +
             '}' +
-            '.katakana-terminator-label {' +
-            '  position: absolute !important;' +
-            '  display: block !important;' +
-            '  box-sizing: border-box !important;' +
-            '  max-width: min(24em, 60vw) !important;' +
-            '  overflow: hidden !important;' +
-            '  padding: 1px 2px !important;' +
-            '  border-radius: 2px !important;' +
-            '  font-family: sans-serif !important;' +
-            '  font-size: 10px !important;' +
+            '.katakana-terminator-gloss:empty {' +
+            '  display: none !important;' +
+            '}' +
+            '.katakana-terminator-gloss {' +
+            '  display: inline !important;' +
+            '  margin: 0 !important;' +
+            '  padding: 0 !important;' +
+            '  border: 0 !important;' +
+            '  background: transparent !important;' +
+            '  color: inherit !important;' +
+            '  font-family: inherit !important;' +
+            '  font-size: 0.85em !important;' +
             '  font-style: normal !important;' +
             '  font-weight: normal !important;' +
             '  letter-spacing: normal !important;' +
-            '  line-height: 1 !important;' +
-            '  text-align: center !important;' +
+            '  line-height: inherit !important;' +
+            '  opacity: 0.72 !important;' +
             '  text-decoration: none !important;' +
-            '  text-overflow: ellipsis !important;' +
+            '  text-indent: 0 !important;' +
             '  text-transform: none !important;' +
             '  white-space: nowrap !important;' +
-            '  word-spacing: normal !important;' +
-            '  pointer-events: none !important;' +
-            '}' +
-            '.katakana-terminator-label-hidden {' +
-            '  display: none !important;' +
+            '  user-select: none !important;' +
             '}'
         );
 
-        annotationLayer = document.createElement('div');
-        annotationLayer.className = 'katakana-terminator-layer';
-        annotationLayer.setAttribute('aria-hidden', 'true');
-        // The popover top layer is not clipped by overflow or stacking contexts.
-        // Fall back to an ordinary document-level layer in older browsers.
-        if (typeof annotationLayer.showPopover === 'function') {
-            annotationLayer.setAttribute('popover', 'manual');
-        }
-        document.body.appendChild(annotationLayer);
-        if (typeof annotationLayer.showPopover === 'function') {
-            try {
-                annotationLayer.showPopover();
-            } catch (err) {
-                annotationLayer.removeAttribute('popover');
-            }
-        }
-
-        // Document scrolling already moves absolute labels together with their
-        // words, so rewriting every label during a root/visual-viewport scroll is
-        // unnecessary and can force repaints that flicker on mobile. Nested scroll
-        // containers still need a position update because the layer is outside of
-        // those containers.
-        window.addEventListener('scroll', function (event) {
-            if (event.target !== document && event.target !== document.documentElement &&
-                event.target !== document.body) {
-                scheduleAnnotationUpdate();
-            }
-        }, true);
-        window.addEventListener('resize', scheduleAnnotationUpdate);
+        // Discover katakana that has just entered the viewport.
+        window.addEventListener('scroll', scheduleViewportRescan, true);
+        window.addEventListener('resize', scheduleViewportRescan);
         if (window.visualViewport) {
-            window.visualViewport.addEventListener('resize', scheduleAnnotationUpdate);
+            window.visualViewport.addEventListener('scroll', scheduleViewportRescan);
+            window.visualViewport.addEventListener('resize', scheduleViewportRescan);
         }
 
         observer = new MutationObserver(mutationHandler);
@@ -991,7 +1144,7 @@
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['class', 'style', 'hidden'],
+            attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'inert'],
         });
 
         started = true;

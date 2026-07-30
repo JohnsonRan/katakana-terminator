@@ -1,9 +1,9 @@
 ### Katakana Terminator 片假名终结者 カタカナ‌ターミネーター
 
 #### In a nutshell 简介
-A userscript that converts *gairaigo* (Japanese loan words) back to English by annotating katakana on web pages.
+A userscript that converts *gairaigo* (Japanese loan words) back to English by appending a parenthetical gloss after katakana on web pages.
 
-这是一个用户脚本：在网页中的日语外来语（片假名）上方标注英文原词。
+这是一个用户脚本：在网页中的日语外来语（片假名）后面用括号标注英文原词。
 
 #### Installation 安装
 Please follow the [installation instructions](https://greasyfork.org/en) to configure a userscript manager (Tampermonkey / Violentmonkey / Greasemonkey),
@@ -12,14 +12,16 @@ then [click here to install the user script](https://github.com/JohnsonRan/katak
 请先[阅读教程](https://greasyfork.org/zh-CN)，在浏览器中安装一个用户脚本管理器。之后[戳这里下载并安装本程序](https://github.com/JohnsonRan/katakana-terminator/raw/master/katakana-terminator.user.js)。
 
 #### Features 功能要点
-- Floating annotation layer (avoids breaking page layout with native ruby rendering)
+- Parenthetical gloss after katakana: `カタカナ（Katakana）`
+- Only annotates currently visible katakana; rescans as you scroll
 - Mutation-driven rescans with debouncing (low overhead on dynamic pages)
 - Persistent translation cache across pages
 - API fallback between Google Translate endpoints
 - Menu commands: global toggle, per-site blacklist, clear cache
 - Sparse mode on non-Japanese pages until katakana is detected
 
-- 浮动标注层，减少对页面排版的影响
+- 片假名后括号标注：`カタカナ（Katakana）`
+- 只处理当前可见的片假名，滚动时再补扫
 - 基于 DOM 变动的防抖扫描，降低动态页面开销
 - 跨页面持久化翻译缓存
 - Google 翻译接口自动回退
